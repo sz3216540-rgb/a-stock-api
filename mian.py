@@ -11,7 +11,6 @@ HEADERS = {
 def get_stock_spot(symbol: str = Query(..., description="6位股票代码")):
     """获取股票实时行情（腾讯财经防封接口）"""
     try:
-        # 判断沪深股市前缀
         prefix = "sh" if symbol.startswith("6") or symbol.startswith("9") else "sz"
         url = f"http://qt.gtimg.cn/q={prefix}{symbol}"
         
@@ -43,10 +42,39 @@ def get_stock_spot(symbol: str = Query(..., description="6位股票代码")):
     except Exception as e:
         return {"status": "error", "message": f"请求失败: {str(e)}"}
 
+@app.get("/stock_history")
+def get_stock_history(symbol: str = Query(..., description="6位股票代码")):
+    """获取股票近期的历史日线数据（含两天前及更早的涨跌）"""
+    try:
+        prefix = "sh" if symbol.startswith("6") or symbol.startswith("9") else "sz"
+        # 请求最近 10 个交易日的日 K 线数据
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{symbol},day,,,10,qfq"
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        data = res.json()
+        
+        # 解析腾讯返回的 K 线数组
+        stock_data = data["data"][f"{prefix}{symbol}"]
+        day_klines = stock_data.get("day", [])
+        
+        history_list = []
+        for item in day_klines:
+            # item 格式: [日期, 开盘价, 收盘价, 最高价, 最低价, 成交量]
+            history_list.append({
+                "日期": item[0],
+                "开盘价": float(item[1]),
+                "收盘价": float(item[2]),
+                "最高价": float(item[3]),
+                "最低价": float(item[4]),
+                "成交量(手)": float(item[5])
+            })
+            
+        return {"status": "success", "symbol": symbol, "data": history_list}
+    except Exception as e:
+        return {"status": "error", "message": f"历史行情获取失败: {str(e)}"}
+
 @app.get("/stock_financial")
 def get_stock_financial(symbol: str = Query(..., description="6位股票代码")):
     """简易财务概况"""
-    # 借助腾讯实时数据中附带的市盈率/市净率等指标
     return get_stock_spot(symbol)
 
 @app.get("/stock_money_flow")
