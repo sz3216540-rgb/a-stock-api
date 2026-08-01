@@ -1,104 +1,144 @@
-from fastapi import FastAPI, Query
-import requests
-import re
+import asyncio
+from typing import Optional
+from fastapi import FastAPI, Query, HTTPException
+import akshare as ak
+import pandas as pd
 
-app = FastAPI(title="A股数据 API 服务")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+app = FastAPI(title="A股数据 API 服务 (AkShare 版)")
 
 def clean_symbol(symbol: str) -> str:
-    """提取纯数字股票代码并自动加上 sh/sz 前缀"""
-    # 提取字符串中的 6 位数字
-    match = re.search(r'\d{6}', symbol)
-    if not match:
-        return symbol
-    code = match.group(0)
-    prefix = "sh" if code.startswith("6") or code.startswith("9") else "sz"
-    return f"{prefix}{code}"
+    """提取 6 位数字股票代码"""
+    code = "".join(filter(str.isdigit, symbol))
+    if len(code) != 6:
+        raise ValueError("股票代码格式不正确，请输入6位数字代码")
+    return code
+
+def clean_dataframe(df: pd.DataFrame):
+    """清理 DataFrame 中的 NaN / Inf，方便 FastAPI 转为 JSON 输出"""
+    if df is None or df.empty:
+        return []
+    # 将 NaN、Inf 替换为 None，便于 JSON 序列化
+    df = df.where(pd.notnull(df), None)
+    return df.to_dict(orient="records")
 
 @app.get("/stock_spot")
-def get_stock_spot(symbol: str = Query(..., description="6位股票代码，如 002891 或 002891.SZ")):
-    """获取股票实时行情"""
+async def get_stock_spot(symbol: str = Query(..., description="6位股票代码，如 002891 或 002891.SZ")):
+    """获取股票实时行情（基于 AkShare 东方财富源）"""
     try:
-        full_symbol = clean_symbol(symbol)
-        url = f"http://qt.gtimg.cn/q={full_symbol}"
+        code = clean_symbol(symbol)
         
-        res = requests.get(url, headers=HEADERS, timeout=10)
-        res.encoding = 'gbk'
-        text = res.text
+        # AkShare 的请求是同步阻塞的，放到 asyncio.to_thread 里运行，配合 wait_for 设置 8 秒超时
+        # stock_zh_a_spot_em 返回全量或指定股票的实时盘口
+        spot_df = await asyncio.wait_for(
+            asyncio.to_thread(ak.stock_zh_a_spot_em), 
+            timeout=8.0
+        )
         
-        if text and "~" in text:
-            parts = text.split("~")
-            if len(parts) > 30:
-                return {
-                    "status": "success",
-                    "symbol": symbol,
-                    "data": {
-                        "股票名称": parts[1],
-                        "股票代码": parts[2],
-                        "最新价": float(parts[3]),
-                        "昨收价": float(parts[4]),
-                        "今开价": float(parts[5]),
-                        "成交量(手)": int(parts[6]),
-                        "涨跌额": float(parts[31]),
-                        "涨跌幅(%)": float(parts[32]),
-                        "最高价": float(parts[33]),
-                        "最低价": float(parts[34]),
-                        "成交额(万)": float(parts[37])
-                    }
-                }
-        return {"status": "error", "message": f"未查询到股票 {symbol} 的数据"}
+        # 筛选指定股票
+        stock_data = spot_df[spot_df["代码"] == code]
+        if stock_data.empty:
+            return {"status": "error", "message": f"未查询到股票 {symbol} 的实时行情"}
+        
+        records = clean_dataframe(stock_data)
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "data": records[0]
+        }
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "请求数据源超时，海外服务器网络波动，请稍后重试"}
     except Exception as e:
-        return {"status": "error", "message": f"请求失败: {str(e)}"}
+        return {"status": "error", "message": f"获取失败: {str(e)}"}
 
 @app.get("/stock_history")
-def get_stock_history(
+async def get_stock_history(
     symbol: str = Query(..., description="6位股票代码"),
     count: int = Query(30, description="获取的历史天数")
 ):
-    """获取股票历史日线 K 线数据（包含任意历史天数及每日涨跌幅）"""
+    """获取股票历史日线 K 线数据"""
     try:
-        full_symbol = clean_symbol(symbol)
-        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={full_symbol},day,,,{count},qfq"
-        res = requests.get(url, headers=HEADERS, timeout=10)
-        data = res.json()
+        code = clean_symbol(symbol)
         
-        stock_data = data.get("data", {}).get(full_symbol, {})
-        # 兼容处理：腾讯可能返回 day 或 qfqday
-        day_klines = stock_data.get("day") or stock_data.get("qfqday", [])
+        # 调用 AkShare 日线接口
+        df = await asyncio.wait_for(
+            asyncio.to_thread(
+                ak.stock_zh_a_hist,
+                symbol=code,
+                period="daily",
+                adjust="qfq"
+            ),
+            timeout=8.0
+        )
         
-        history_list = []
-        prev_close = None
+        if df.empty:
+            return {"status": "error", "message": f"未查询到股票 {symbol} 的历史行情"}
         
-        for item in day_klines:
-            close_price = float(item[2])
-            pct_change = 0.0
-            if prev_close and prev_close > 0:
-                pct_change = round(((close_price - prev_close) / prev_close) * 100, 2)
-            prev_close = close_price
-            
-            history_list.append({
-                "日期": item[0],
-                "开盘价": float(item[1]),
-                "收盘价": close_price,
-                "最高价": float(item[3]),
-                "最低价": float(item[4]),
-                "成交量(手)": float(item[5]),
-                "涨跌幅(%)": pct_change
-            })
-            
-        return {"status": "success", "symbol": symbol, "count": len(history_list), "data": history_list}
+        # 取最近 count 天
+        df_recent = df.tail(count)
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "count": len(df_recent),
+            "data": clean_dataframe(df_recent)
+        }
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "请求历史行情超时"}
     except Exception as e:
         return {"status": "error", "message": f"历史行情获取失败: {str(e)}"}
 
 @app.get("/stock_financial")
-def get_stock_financial(symbol: str = Query(..., description="6位股票代码")):
-    """财务概况"""
-    return get_stock_spot(symbol)
+async def get_stock_financial(symbol: str = Query(..., description="6位股票代码")):
+    """【财务数据】获取主要财务指标摘要（同花顺/东方财富数据源）"""
+    try:
+        code = clean_symbol(symbol)
+        
+        # AkShare 财务指标摘要接口
+        df = await asyncio.wait_for(
+            asyncio.to_thread(
+                ak.stock_financial_abstract_ths,
+                symbol=code,
+                indicator="按报告期"
+            ),
+            timeout=10.0
+        )
+        
+        if df.empty:
+            return {"status": "error", "message": f"未查询到股票 {symbol} 的财务报表数据"}
+            
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "data": clean_dataframe(df)
+        }
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "请求财务数据超时，Render海外节点访问受限，请重试"}
+    except Exception as e:
+        return {"status": "error", "message": f"财务数据获取失败: {str(e)}"}
 
 @app.get("/stock_money_flow")
-def get_stock_money_flow(symbol: str = Query(..., description="6位股票代码")):
-    """主力资金概况"""
-    return get_stock_spot(symbol)
+async def get_stock_money_flow(symbol: str = Query(..., description="6位股票代码")):
+    """【资金流向】获取个股资金流向（主力/大单/散户）"""
+    try:
+        code = clean_symbol(symbol)
+        
+        df = await asyncio.wait_for(
+            asyncio.to_thread(
+                ak.stock_individual_fund_flow,
+                stock=code,
+                market="sh" if code.startswith("6") or code.startswith("9") else "sz"
+            ),
+            timeout=8.0
+        )
+        
+        if df.empty:
+            return {"status": "error", "message": f"未查询到股票 {symbol} 的资金流向数据"}
+            
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "data": clean_dataframe(df.tail(15))  # 返回最近15天的资金流向
+        }
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "获取资金流向超时"}
+    except Exception as e:
+        return {"status": "error", "message": f"资金流向获取失败: {str(e)}"}
